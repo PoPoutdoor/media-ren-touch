@@ -1,0 +1,346 @@
+#!/bin/bash 
+#
+# media-ren-touch: Organize media files by embedded EXIF metadata
+#
+#	Rename, touch and set readonly files with EXIF recursively.
+#	With options to add/update EXIF metadata (if file spec supported)
+#
+# 	*current supported mime type: Image, Video, Audio
+#
+# Change log:
+#
+#	v0.0	2021-09-24, Rewrite of original script.
+#	v0.1	2021-09-28, Initial release.
+#
+# ====================================
+#
+# Copyright (C) 2021 Plato Leung <PoPoutdoor@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# ====================================
+#
+# Editor:	tab=4 for code, right-margin=132 
+#			tab=8 for 'help' display, right-margin=80
+#
+# Depends on 'exiftool'
+#
+#	Gentoo: media-libs/exiftool
+#	Others: perl/exiftool
+#
+# ====================================
+
+# check dependence
+exif=`which exiftool 2> /dev/null`
+[[ -z "$exif" ]] && echo -n "'exiftool' not found! "
+if [ ! -x "$exif" ]; then
+	echo "'exiftool' is needed for this script, exit now!"
+	exit 1
+fi
+
+# Output filename/EXIF date format
+RenameAs='%Y%m%d_%H%M%S'
+
+unalias date 2> /dev/null
+
+t_info_1=''
+t_info_2=''
+t_info_3=''
+t_modTS=''
+src_dir=''
+upd_tags=''
+
+# parse command line
+while (( "$#" )); do
+	case "$1" in
+		-m)
+			if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+				t_info_1="$2"
+				shift 2
+			else
+				echo "Error: Argument for $1 is missing" >&2
+				exit 1
+			fi
+		;;
+		-t) 
+			if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+				t_info_2="$2"
+				shift 2
+			else
+				echo "Error: Argument for $1 is missing" >&2
+				exit 1
+			fi
+		;;
+		-u) 
+			if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+				t_info_3="$2"
+				shift 2
+			else
+				echo "Error: Argument for $1 is missing" >&2
+				exit 1
+			fi
+		;;
+		-a)
+			t_modTS='y'
+			shift
+		;;
+		-h)
+			echo "Usage: $(basename $0) [-m 'Model/*Genre string'] [-t 'ModelType/*Album string'] [-u 'Make/*Artist string'] [-a] [--help] [src dir] [out dir]
+
+Note: Don't set above update tags if source contains mixed media
+"
+			exit
+		;;
+		--help)
+			# tab: 8 for console display
+			echo "Usage: $(basename $0) [opts] [source directory] [output directory]
+
+	Update EXIF metadata options:
+
+	    -m	String of 'Model/*Artist' to be set in file EXIF metadata, only
+		if tag is empty.
+ 
+	    -t	String of 'ModelType/*Album' to be set in file EXIF metadata,
+		only if tag is empty.
+
+	    -u	String of 'Make/*Artist' to be set in file EXIF metadata, only
+		if tag is empty.
+
+	    * only for audio files
+
+	    Note: Don't set above update tags if source contains mixed media
+
+	    -a	Add 'DateTimeOriginal' to file if tags above not set and ALL
+		timestamp tags not set. Timestamp value is 'guess' from	filename
+		with sufficient digits (for image/video only)
+
+	    -h|--help	This help text.
+
+	directory:
+
+	    source directory contains media files, default to current directory.
+	    output directory holds ALL media files, default to current directory.
+
+	Output filename format (for image/video only):
+
+	    'YYYYmmdd_HHMMSS.EXT'
+	    'YYYYmmdd_HHMMSS_cc.EXT' if more than one file with the same 
+	    timestamp
+
+"
+			exit
+		;;
+		-*|--*=) # unsupported flags
+			echo "Error: Unsupported flag $1" >&2
+			exit 1
+		;;
+		*) # preserve positional arguments
+			[[ -z "$src_dir" ]] && src_dir="$1" || src_dir+=" $1"
+			shift
+		;;
+	esac
+done
+
+# set positional arguments in their proper place
+eval set -- "$src_dir"
+# use FIRST non-opts as source dir, SECOND as output dir
+src_dir=`realpath "${1:-./}"` || exit 1
+out_dir=`realpath "${2:-./}"` || exit 1
+[[ "$src_dir" = "$out_dir" ]] && out_dir="${out_dir}/_out_"
+# create directory for output
+mkdir "${out_dir}" || exit 1
+
+# Test output directory rights, needs read/write/create
+touch "${out_dir}/_test_" || exit 1 && rm -f "${out_dir}/_test_"
+
+# process files in source directory
+find "${src_dir}" -not -empty -type f -print0 | sort -z | while IFS= read -r -d '' f; do
+
+	# Let's have some output
+	#echo "Process $f"
+
+	out_filename=''
+	upd_tags=''
+
+	# only handle supported media
+	mime=$($exif -MIMEType -s3 "$f" 2> /dev/null)
+	if [[ "${mime%/*}" = "image" || "${mime%/*}" = "video" ]]; then
+		info_tag_1='Make'
+		info_tag_2='Model'
+		info_tag_3='ModelType'
+		ts_tag_1='DateTimeOriginal'
+		ts_tag_2='CreateDate'
+		ts_tag_3='ModifyDate'
+	elif [[ "${mime%/*}" = "audio" ]]; then
+		info_tag_1='Artist'
+		info_tag_2='Genre'
+		info_tag_3='Album'
+		ts_tag_1='DateTimeOriginal'
+		ts_tag_2='RecordingTime'
+		ts_tag_3='Year'
+	else
+		[[ -e "$out_dir/unsupported" ]] || mkdir -p "$out_dir/unsupported"
+		# mime type not supported, have a copy
+		cp -a "$f" "$out_dir/unsupported"
+		continue
+	fi
+	# fetch file EXIF metadata
+	ret=$($exif -s2 -fast -d "$RenameAs" -$info_tag_1 -$info_tag_2 -$info_tag_3 -$ts_tag_1 -$ts_tag_2 -$ts_tag_3 "$f")
+	f_info_1=$(echo "$ret" | grep $info_tag_1 | cut -d ' ' -f2-)
+# Custom $info_tag_1 name
+	[[ "$f_info_1" = "SX748" ]] && f_info_1="DiMAGE X50"
+	[[ "$f_info_1" = "HTC_B830x" ]] && f_info_1="HTC J butterfly"
+	[[ "$f_info_1" = "D5833" ]] && f_info_1="Sony Z3c"
+	[[ "$f_info_1" = "u1050SW,S1050SW" ]] && f_info_1="Olympus"
+#----------------
+	f_info_2=$(echo "$ret" | grep $info_tag_2 | cut -d ' ' -f2-)
+	f_info_3=$(echo "$ret" | grep $info_tag_3 | cut -d ' ' -f2-)
+	f_ts_1=$(echo "$ret" | grep $ts_tag_1 | cut -d ' ' -f2-)
+	f_ts_2=$(echo "$ret" | grep $ts_tag_2 | cut -d ' ' -f2-)
+	f_ts_3=$(echo "$ret" | grep $ts_tag_3 | cut -d ' ' -f2-)
+	# skip rename for 'audio' files
+	[[ "${mime%/*}" = "audio" ]] && f_name=`basename "${f%.*}"` || f_name=$f_ts_1
+#
+# info tags
+#
+	# use command line values to update meta while file's tag is empty/missing
+	if [[ ! -z "$t_info_1" || ! -z "$t_info_2" || ! -z "$t_info_3" ]]; then
+		if [[ -z "$f_info_3" && ! -z "$t_info_3" ]]; then
+			f_info_3="$t_info_3"
+			upd_tags+=" -$info_tag_3='$f_info_3'"
+		fi
+		if [[ -z "$f_info_2" && ! -z "$t_info_2" ]]; then
+			f_info_2="$t_info_2"
+			upd_tags+=" -$info_tag_2='$f_info_2'"
+		fi
+		if [[ -z "$f_info_1" && ! -z "$t_info_1" ]]; then
+			f_info_1="$t_info_1"
+			upd_tags+=" -$info_tag_1='$f_info_1'"
+		fi
+	fi
+
+	# missing info tags, so 'unidentified' (for file move)
+	[[ -z "$f_info_1" && -z "$f_info_2" && -z "$f_info_3" ]] && f_info_1='unidentified'
+	# assign from other info tags (for file move)
+	if [ -z "$f_info_1" ]; then
+		[[ -z "$f_info_2" ]] || f_info_1="$f_info_2"
+		[[ -z "$f_info_1" ]] && f_info_1="$f_info_3"
+	fi
+#
+# timestamp tags
+#
+	# missing timestamp tags, so guess from filename, excludes 'audio' files
+	if [[ "${mime%/*}" != "audio" && -z "$f_ts_1" && -z "$f_ts_2" && -z "$f_ts_3" ]]; then
+		f_hints=$(basename "${f%.*}" | sed 's/[^-_ 0-9]//g; s/[- ]/_/g; s/_\{2,\}/_/; s/_$//; s/^_//')
+		# no hints, try next file!
+		#[[ -z "$f_hints" ]] && continue
+		hints_date=$(echo "$f_hints" | cut -d '_' -f 1 | cut -b -8)
+		hints_len=$(echo "$hints_date" | wc -L)
+		# no hints or can't even guess, try next file!
+		if (( $hints_len < 6 )); then
+			[[ -e "$out_dir/unprocessed" ]] || mkdir -p "$out_dir/unprocessed"
+			# mime type not supported, have a copy
+			cp -a "$f" "$out_dir/unprocessed"		
+			continue
+		fi
+
+		for d in dmY mdY Ymd; do
+			# try Ymd
+			if [ $d = 'Ymd' ]; then
+				if (( $hints_len == 6 )); then
+					guess_year=$(echo "$hints_date" | cut -b -2)
+					# %y: patch centry
+					(( "$guess_year" >= 70 && "$guess_year" <= 99 )) && cent=19 || cent=20
+					guess_year=$cent$guess_year
+					guess_month=$(echo "$hints_date" | cut -b 3,4)
+					guess_day=$(echo "$hints_date" | cut -b 5-)
+				else
+					guess_year=$(echo "$hints_date" | cut -b -4)
+					guess_month=$(echo "$hints_date" | cut -b 5,6)
+					guess_day=$(echo "$hints_date" | cut -b 7-)
+				fi
+			else
+				guess_year=$(echo "$hints_date" | cut -b 5-)
+				if (( $hints_len == 6 )); then
+					# %y: patch centry
+					(( "$guess_year" >= 70 && "$guess_year" <= 99 )) && cent=19 || cent=20
+					guess_year=$cent$guess_year
+				fi
+				
+				if [ $d = 'mdY' ]; then
+					guess_month=$(echo "$hints_date" | cut -b -2)
+					guess_day=$(echo "$hints_date" | cut -b 3,4)
+				else
+					guess_month=$(echo "$hints_date" | cut -b 3,4)
+					guess_day=$(echo "$hints_date" | cut -b -2)
+				fi
+			fi
+
+			# Guess wrong? try another format
+			(( "$guess_year" > $(date +%Y -d today) || "$guess_year" < 1980 )) && continue
+			(( "$guess_month" > 12 || "$guess_day" > 31 )) && continue
+
+			f_ts_1="$guess_year$guess_month$guess_day""_$(echo "$f_hints" | cut -d '_' -f 2-)"
+			# add DateTimeOriginal tag
+			[[ -z "$t_modTS" ]] || upd_tags+=" -$ts_tag_1=\"$f_ts_1\""
+
+			break
+		done
+	fi
+#
+# file move/rename
+#
+	# assign from other timestamp tags (for file rename)
+	if [[ "${mime%/*}" != "audio" && -z "$f_name" ]]; then
+		[[ -z "$f_ts_2" ]] || f_ts_1="$f_ts_2"
+		[[ -z "$f_ts_1" ]] && f_ts_1="$f_ts_3"
+		f_name=$f_ts_1
+	fi
+
+	# suffix $f_info_1 if !-z $f_info_2
+	[[ -z "$f_info_2" ]] || f_info_1+="/$f_info_2"
+	# suffix $f_info_1 if !-z $f_info_3
+	[[ -z "$f_info_3" ]] || f_info_1+="/$f_info_3"
+	
+	if [[ -z "$upd_tags" ]]; then
+		[[ -e "$out_dir/$f_info_1" ]] || mkdir -p "$out_dir/$f_info_1"
+		out_filename="$out_dir/$f_info_1/$f_name.${f#*.}"
+	else
+		f_info_1='updated'
+		[[ -e "$out_dir/modified/original" ]] || mkdir -p "${out_dir}/modified/original"
+		[[ -e "$out_dir/modified/$f_info_1" ]] || mkdir -p "$out_dir/modified/$f_info_1"
+		out_filename="$out_dir/modified/$f_info_1/$f_name.${f#*.}"
+		# do backup
+		cp -a "$f" "$out_dir/modified/original"
+	fi
+	# handle filename with same timestamp
+	if [ -e "$out_filename" ]; then
+		c=1
+		while [ -e "$out_filename" ]; do
+			out_filename="${out_filename%/*}/$f_name""_$(printf %02d $c).${f#*.}"
+			c=$(( c += 1 ))
+		done
+	fi
+	# prepare timestamp for 'touch'
+	t_ts=$(echo "${f_ts_1//[^0-9]/}" | cut -b -12)
+	t_ss=$(echo "${f_ts_1//[^0-9]/}" | cut -b 13-)
+	[[ -z "$t_ss" ]] || t_ts=$t_ts.$t_ss
+	# rename & touch with EXIF timestamp, set read-only on Output file
+	cp -a "$f" "$out_filename"
+	[[ -z "$upd_tags" ]] || $exif -d "$RenameAs" -q $upd_tags -overwrite_original "$out_filename"
+	[[ -z "$t_ts" ]] || touch -t "$t_ts" "$out_filename"
+	chmod a-wx "$out_filename"
+
+done
+
